@@ -3,7 +3,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Set, Tuple
+from typing import Optional, List, Dict, Set
 
 # ================== CONFIG VIA ENV ==================
 
@@ -17,6 +17,9 @@ FOLLOW_ON_REPOST = os.getenv("FOLLOW_ON_REPOST", "0") == "1"
 LIST_MEMBER_LIMIT = int(os.getenv("LIST_MEMBER_LIMIT", "200"))
 AUTHOR_POSTS_PER_MEMBER = int(os.getenv("AUTHOR_POSTS_PER_MEMBER", "50"))
 FEED_MAX_ITEMS = int(os.getenv("FEED_MAX_ITEMS", "1000"))
+
+def now_z() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ================== HELPERS ==================
 
@@ -41,9 +44,11 @@ def load_repost_log(path: str) -> Set[str]:
         return {line.strip() for line in f if line.strip()}
 
 def save_repost_log(path: str, uris: Set[str]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         for uri in sorted(uris):
             f.write(uri + "\n")
+    os.replace(tmp, path)
 
 def has_media(record) -> bool:
     embed = getattr(record, "embed", None)
@@ -63,8 +68,8 @@ def is_quote_post(record) -> bool:
 
 # ================== URI NORMALIZERS ==================
 
-FEED_URL_RE = re.compile(r"https://bsky.app/profile/([^/]+)/feed/([^/?#]+)", re.I)
-LIST_URL_RE = re.compile(r"https://bsky.app/profile/([^/]+)/lists/([^/?#]+)", re.I)
+FEED_URL_RE = re.compile(r"^https?://(www\.)?bsky\.app/profile/([^/]+)/feed/([^/?#]+)", re.I)
+LIST_URL_RE = re.compile(r"^https?://(www\.)?bsky\.app/profile/([^/]+)/lists/([^/?#]+)", re.I)
 
 def resolve_handle_to_did(client: Client, actor: str) -> Optional[str]:
     if actor.startswith("did:"):
@@ -78,33 +83,40 @@ def resolve_handle_to_did(client: Client, actor: str) -> Optional[str]:
 def normalize_feed_uri(client: Client, link: str) -> Optional[str]:
     if not link:
         return None
-    if link.startswith("at://"):
+    link = link.strip()
+    if link.startswith("at://") and "/app.bsky.feed.generator/" in link:
         return link
     m = FEED_URL_RE.match(link)
     if not m:
         return None
-    did = resolve_handle_to_did(client, m.group(1))
+    actor = m.group(2)
+    rkey = m.group(3)
+    did = resolve_handle_to_did(client, actor)
     if not did:
         return None
-    return f"at://{did}/app.bsky.feed.generator/{m.group(2)}"
+    return f"at://{did}/app.bsky.feed.generator/{rkey}"
 
 def normalize_list_uri(client: Client, link: str) -> Optional[str]:
     if not link:
         return None
-    if link.startswith("at://"):
+    link = link.strip()
+    if link.startswith("at://") and "/app.bsky.graph.list/" in link:
         return link
     m = LIST_URL_RE.match(link)
     if not m:
         return None
-    did = resolve_handle_to_did(client, m.group(1))
+    actor = m.group(2)
+    rkey = m.group(3)
+    did = resolve_handle_to_did(client, actor)
     if not did:
         return None
-    return f"at://{did}/app.bsky.graph.list/{m.group(2)}"
+    return f"at://{did}/app.bsky.graph.list/{rkey}"
 
 # ================== FETCHERS ==================
 
 def fetch_feed_items(client: Client, feed_uri: str) -> List:
-    items, cursor = [], None
+    items: List = []
+    cursor = None
     while True:
         params = {"feed": feed_uri, "limit": 100}
         if cursor:
@@ -117,39 +129,69 @@ def fetch_feed_items(client: Client, feed_uri: str) -> List:
             break
     return items[:FEED_MAX_ITEMS]
 
-def fetch_list_members(client: Client, list_uri: str) -> List[str]:
-    members, cursor = [], None
+def fetch_list_member_dids(client: Client, list_uri: str) -> Set[str]:
+    members: Set[str] = set()
+    cursor = None
     while True:
         params = {"list": list_uri, "limit": 100}
         if cursor:
             params["cursor"] = cursor
         out = client.app.bsky.graph.get_list(params)
-        for it in getattr(out, "items", []) or []:
+        items = getattr(out, "items", []) or []
+        for it in items:
             subj = getattr(it, "subject", None)
-            if subj and getattr(subj, "did", None):
-                members.append(subj.did)
-            if len(members) >= LIST_MEMBER_LIMIT:
-                return members[:LIST_MEMBER_LIMIT]
+            did = getattr(subj, "did", None) if subj else None
+            if did:
+                members.add(did)
+                if len(members) >= LIST_MEMBER_LIMIT:
+                    return members
         cursor = getattr(out, "cursor", None)
         if not cursor:
             break
-    return members[:LIST_MEMBER_LIMIT]
+    return members
 
-def fetch_author_posts(client: Client, actor: str) -> List:
+# ================== ACTIONS ==================
+
+def do_like(client: Client, uri: str, cid: str) -> bool:
     try:
-        out = client.app.bsky.feed.get_author_feed({"actor": actor, "limit": AUTHOR_POSTS_PER_MEMBER})
-        return getattr(out, "feed", []) or []
+        client.app.bsky.feed.like.create(
+            repo=client.me.did,
+            record={
+                "subject": {"uri": uri, "cid": cid},
+                "createdAt": now_z(),
+            },
+        )
+        return True
     except Exception:
-        return []
+        return False
+
+def do_follow_if_needed(client: Client, actor_did: str) -> bool:
+    """
+    Follow alleen als we nog niet volgen.
+    Return True als we gevolgd hebben, False anders.
+    """
+    try:
+        prof = client.app.bsky.actor.get_profile({"actor": actor_did})
+        viewer = getattr(prof, "viewer", None)
+        if viewer and getattr(viewer, "following", None):
+            return False  # al gevolgd
+
+        client.app.bsky.graph.follow.create(
+            repo=client.me.did,
+            record={"subject": actor_did, "createdAt": now_z()},
+        )
+        return True
+    except Exception:
+        return False
 
 # ================== MAIN ==================
 
 def main():
-    username = os.getenv("BSKY_USERNAME")
-    password = os.getenv("BSKY_PASSWORD")
+    username = (os.getenv("BSKY_USERNAME") or "").strip()
+    password = (os.getenv("BSKY_PASSWORD") or "").strip()
 
     if not username or not password:
-        log("❌ Missing login env vars")
+        log("❌ Missing env BSKY_USERNAME / BSKY_PASSWORD")
         return
 
     client = Client()
@@ -159,23 +201,40 @@ def main():
     cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_BACK)
     done = load_repost_log(REPOST_LOG_FILE)
 
-    # FEEDS
-    feed_links = [os.getenv(f"FEED_{i}_LINK", "") for i in range(1, 11)]
-    feeds = [normalize_feed_uri(client, f) for f in feed_links if f]
-
-    # STOPLISTS
-    stop_links = [os.getenv(f"STOPLIST_{i}_LINK", "") for i in range(1, 11)]
-    stop_dids = set()
-    for link in stop_links:
-        uri = normalize_list_uri(client, link)
+    # FEEDS (max 10 via env)
+    feed_uris: List[str] = []
+    for i in range(1, 11):
+        link = (os.getenv(f"FEED_{i}_LINK") or "").strip()
+        if not link:
+            continue
+        uri = normalize_feed_uri(client, link)
         if uri:
-            stop_dids.update(fetch_list_members(client, uri))
+            feed_uris.append(uri)
 
-    candidates = []
+    if not feed_uris:
+        log("ℹ️ Geen FEEDS ingevuld — niets te doen.")
+        return
 
-    for feed_uri in feeds:
-        log(f"📥 Feed: {feed_uri}")
-        for item in fetch_feed_items(client, feed_uri):
+    # STOPLISTS (max 10) -> DID set
+    stop_dids: Set[str] = set()
+    for i in range(1, 11):
+        link = (os.getenv(f"STOPLIST_{i}_LINK") or "").strip()
+        if not link:
+            continue
+        list_uri = normalize_list_uri(client, link)
+        if list_uri:
+            stop_dids |= fetch_list_member_dids(client, list_uri)
+
+    if stop_dids:
+        log(f"🛑 Stoplijst leden geladen: {len(stop_dids)}")
+
+    # Collect candidates
+    candidates: List[Dict] = []
+    for feed_uri in feed_uris:
+        log(f"📥 Feed ophalen: {feed_uri}")
+        items = fetch_feed_items(client, feed_uri)
+
+        for item in items:
             post = item.post
             record = post.record
             uri = post.uri
@@ -183,13 +242,21 @@ def main():
 
             if uri in done:
                 continue
+
+            # boosts/reposts overslaan
             if hasattr(item, "reason") and item.reason is not None:
                 continue
+
+            # replies overslaan
+            if getattr(record, "reply", None):
+                continue
+
+            # quote overslaan
             if is_quote_post(record):
                 continue
+
+            # media-only
             if not has_media(record):
-                continue
-            if getattr(record, "reply", None):
                 continue
 
             created_dt = parse_time(record, post)
@@ -197,55 +264,61 @@ def main():
                 continue
 
             author_did = getattr(post.author, "did", None)
+            if not author_did:
+                continue
+
+            # stoplist filter
             if author_did in stop_dids:
                 continue
 
-            candidates.append({
-                "uri": uri,
-                "cid": cid,
-                "author": author_did,
-                "created": created_dt
-            })
+            candidates.append(
+                {
+                    "uri": uri,
+                    "cid": cid,
+                    "author_did": author_did,
+                    "created": created_dt,
+                }
+            )
 
     candidates.sort(key=lambda x: x["created"])
+    log(f"🧩 Candidates: {len(candidates)}")
 
     reposted = 0
-    per_user = {}
+    liked = 0
+    followed = 0
+    per_user: Dict[str, int] = {}
 
     for c in candidates:
         if reposted >= MAX_PER_RUN:
             break
 
-        au = c["author"]
+        au = c["author_did"]
         per_user.setdefault(au, 0)
         if per_user[au] >= MAX_PER_USER:
             continue
 
         try:
+            # Repost
             client.app.bsky.feed.repost.create(
                 repo=client.me.did,
                 record={
                     "subject": {"uri": c["uri"], "cid": c["cid"]},
-                    "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "createdAt": now_z(),
                 },
             )
+
             done.add(c["uri"])
             per_user[au] += 1
             reposted += 1
 
+            # Like (best effort)
+            if do_like(client, c["uri"], c["cid"]):
+                liked += 1
+
+            # Follow (best effort)
             if FOLLOW_ON_REPOST:
-                try:
-                    profile = client.app.bsky.actor.get_profile({"actor": au})
-                    if not getattr(profile.viewer, "following", None):
-                        client.app.bsky.graph.follow.create(
-                            repo=client.me.did,
-                            record={
-                                "subject": au,
-                                "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            },
-                        )
-                except Exception:
-                    pass
+                if do_follow_if_needed(client, au):
+                    followed += 1
 
             time.sleep(POST_DELAY_SECONDS)
 
@@ -254,7 +327,7 @@ def main():
             time.sleep(5)
 
     save_repost_log(REPOST_LOG_FILE, done)
-    log(f"🔥 Done — {reposted} reposts")
+    log(f"🔥 Done — {reposted} reposts, {liked} likes, {followed} follows")
 
 if __name__ == "__main__":
     main()
