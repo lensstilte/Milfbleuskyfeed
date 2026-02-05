@@ -45,13 +45,13 @@ jobs:
           MAX_PER_USER: "10"
 
           # Zet hier jouw bleuskypromo bronnen (of laat leeg om te skippen)
-          FEED_1_LINK: ""
-          FEED_1_NOTE: ""
+          FEED_1_LINK: "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/feed/aaac7nrhpte2k"
+          FEED_1_NOTE: "milfbleuskyfeed"
           LIST_1_LINK: ""
           LIST_1_NOTE: ""
 
-          STOPLIST_1_LINK: ""
-          STOPLIST_1_NOTE: ""
+          STOPLIST_1_LINK: "https://bsky.app/profile/did:plc:mbmrdjswath6qc3sdpal5vqh/lists/3mcksmjmdtc2t"
+          STOPLIST_1_NOTE: "milfstop"
           FOLLOW_ON_REPOST: "0"
 
           LIST_MEMBER_LIMIT: "200"
