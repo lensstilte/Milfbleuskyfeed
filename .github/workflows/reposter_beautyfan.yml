@@ -1,3 +1,6 @@
+env:
+  WORKFLOWS_DISABLED: true
+
 name: Reposter beautyfan
 
 on:
